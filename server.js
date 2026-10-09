@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import http from 'http';
 import path from 'path';
+import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
@@ -27,9 +28,44 @@ if (!JWT_SECRET) throw new Error('JWT_SECRET is required.');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  max: 10
+  // Railway/Postgres providers commonly require TLS in production.
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined,
+  max: Number(process.env.PGPOOL_MAX || 10),
+  connectionTimeoutMillis: 10000,
+  idleTimeoutMillis: 30000,
+  query_timeout: 15000,
+  keepAlive: true
 });
+pool.on('error', (err) => console.error('Unexpected PostgreSQL pool error:', err.message));
+
+async function initializeDatabase() {
+  // Keep schema.sql beside server.js so deployment can initialize an empty database.
+  const schema = await readFile(path.join(__dirname, 'schema.sql'), 'utf8');
+  await pool.query(schema);
+  // Safe, additive migrations for databases created by an earlier VIBORA version.
+  await pool.query(`
+    ALTER TABLE players ADD COLUMN IF NOT EXISTS country TEXT NOT NULL DEFAULT 'Nigeria 🇳🇬';
+    ALTER TABLE players ADD COLUMN IF NOT EXISTS region TEXT NOT NULL DEFAULT 'Global';
+    ALTER TABLE players ADD COLUMN IF NOT EXISTS personality TEXT NOT NULL DEFAULT 'Ambitious';
+    ALTER TABLE players ADD COLUMN IF NOT EXISTS style TEXT NOT NULL DEFAULT 'Street Luxe';
+    ALTER TABLE players ADD COLUMN IF NOT EXISTS money INTEGER NOT NULL DEFAULT 10000;
+    ALTER TABLE players ADD COLUMN IF NOT EXISTS fame INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE players ADD COLUMN IF NOT EXISTS followers INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE players ADD COLUMN IF NOT EXISTS day INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE players ADD COLUMN IF NOT EXISTS business_level INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE players ADD COLUMN IF NOT EXISTS business_started BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE players ADD COLUMN IF NOT EXISTS location TEXT NOT NULL DEFAULT 'Home';
+    ALTER TABLE players ADD COLUMN IF NOT EXISTS activity TEXT NOT NULL DEFAULT 'New life started';
+    ALTER TABLE players ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+    ALTER TABLE players ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+    ALTER TABLE life_events ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+    ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+    CREATE INDEX IF NOT EXISTS life_events_player_created_idx ON life_events(player_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS chat_messages_location_created_idx ON chat_messages(location, created_at DESC);
+  `);
+  await pool.query('SELECT 1');
+  console.log('VIBORA database schema ready.');
+}
 
 const LOCATIONS = ['Home', 'Work District', 'Market Street', 'Pulse Club'];
 const MAX_NAME = 20;
@@ -118,8 +154,8 @@ async function transactionUpdate(id, updater) {
 function publicPlayer(p) { return { id: p.id, name: p.name, location: p.location, activity: p.activity, fame: p.fame, followers: p.followers }; }
 
 app.get('/health', async (_req, res) => {
-  try { await pool.query('SELECT 1'); res.json({ ok: true, service: 'VIBORA', time: new Date().toISOString() }); }
-  catch { res.status(503).json({ ok: false }); }
+  try { await pool.query('SELECT 1'); res.json({ ok: true, service: 'VIBORA', database: 'connected', time: new Date().toISOString() }); }
+  catch (err) { console.error('Health check failed:', err.message); res.status(503).json({ ok: false, service: 'VIBORA', database: 'unavailable' }); }
 });
 
 app.post('/api/auth/signup', async (req, res) => {
@@ -256,23 +292,73 @@ io.use((socket,next)=>{
 });
 
 io.on('connection', async socket=>{
-  const p=await playerById(socket.user.sub); if(!p){socket.disconnect(true);return;}
-  online.set(socket.id,{playerId:p.id,location:p.location});
-  socket.join(`location:${p.location}`);
-  socket.emit('presence:update',{location:p.location,players:await onlinePlayers(p.location)});
-  await emitPresence(p.location);
+  try {
+    const p=await playerById(socket.user.sub); if(!p){socket.disconnect(true);return;}
+    online.set(socket.id,{playerId:p.id,location:p.location});
+    socket.join(`location:${p.location}`);
+    socket.emit('presence:update',{location:p.location,players:await onlinePlayers(p.location)});
+    await emitPresence(p.location);
+  } catch (err) { console.error('Socket connection setup failed:', err.message); socket.disconnect(true); return; }
 
-  socket.on('chat:send', async raw=>{
-    const message=cleanText(raw?.message,MAX_MESSAGE); if(!message) return;
-    const current=await playerById(socket.user.sub); if(!current) return;
-    const location=current.location;
-    const {rows}=await pool.query('INSERT INTO chat_messages(player_id,player_name,location,message) VALUES($1,$2,$3,$4) RETURNING id,player_id,player_name,location,message,created_at',[current.id,current.name,location,message]);
-    io.to(`location:${location}`).emit('chat:message',rows[0]);
+  socket.on('location:sync', async () => {
+    try {
+      const current = await playerById(socket.user.sub);
+      if (!current) return socket.disconnect(true);
+      const old = online.get(socket.id);
+      const oldLocation = old?.location;
+      const newLocation = LOCATIONS.includes(current.location) ? current.location : 'Home';
+      if (oldLocation && oldLocation !== newLocation) socket.leave(`location:${oldLocation}`);
+      socket.join(`location:${newLocation}`);
+      online.set(socket.id, { playerId: current.id, location: newLocation });
+      socket.emit('presence:update', { location: newLocation, players: await onlinePlayers(newLocation) });
+      if (oldLocation) await emitPresence(oldLocation);
+      await emitPresence(newLocation);
+    } catch (err) { console.error('Location sync failed:', err.message); }
   });
 
-  socket.on('disconnect',async()=>{ const info=online.get(socket.id); online.delete(socket.id); if(info) await emitPresence(info.location); });
+  socket.on('chat:send', async raw=>{
+    try {
+      const message=cleanText(raw?.message,MAX_MESSAGE); if(!message) return;
+      const current=await playerById(socket.user.sub); if(!current) return;
+      const location=LOCATIONS.includes(current.location)?current.location:'Home';
+      const {rows}=await pool.query('INSERT INTO chat_messages(player_id,player_name,location,message) VALUES($1,$2,$3,$4) RETURNING id,player_id,player_name,location,message,created_at',[current.id,current.name,location,message]);
+      io.to(`location:${location}`).emit('chat:message',rows[0]);
+    } catch (err) { console.error('Chat message failed:', err.message); socket.emit('chat:error', { error: 'Message could not be sent. Please try again.' }); }
+  });
+
+  socket.on('disconnect',async()=>{ const info=online.get(socket.id); online.delete(socket.id); if(info) { try { await emitPresence(info.location); } catch (err) { console.error('Presence update failed:', err.message); } } });
 });
 
+// Express 5 catch-all; static frontend is deployed at public/index.html.
 app.get('/{*splat}', (_req,res)=>res.sendFile(path.join(__dirname,'public','index.html')));
 
-httpServer.listen(PORT,'0.0.0.0',()=>console.log(`VIBORA online server listening on ${PORT}`));
+app.use((err, _req, res, _next) => {
+  console.error('Unhandled request error:', err);
+  if (res.headersSent) return;
+  const status = Number(err.status) >= 400 && Number(err.status) < 600 ? Number(err.status) : 500;
+  res.status(status).json({ error: status === 500 ? 'Server error. Please try again shortly.' : err.message });
+});
+
+async function start() {
+  try {
+    await initializeDatabase();
+    httpServer.listen(PORT, '0.0.0.0', () => console.log(`VIBORA online server listening on ${PORT}`));
+  } catch (err) {
+    console.error('VIBORA startup failed. Check DATABASE_URL, database availability, and schema.sql:', err.message);
+    process.exitCode = 1;
+    await pool.end().catch(() => {});
+    process.exit();
+  }
+}
+
+async function shutdown(signal) {
+  console.log(`${signal} received; shutting down VIBORA gracefully.`);
+  httpServer.close(async () => {
+    await pool.end().catch(err => console.error('Database shutdown error:', err.message));
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(1), 10000).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+start();
