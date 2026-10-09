@@ -1,3 +1,4 @@
+
 CREATE TABLE IF NOT EXISTS players (
   id UUID PRIMARY KEY,
   email TEXT UNIQUE NOT NULL,
@@ -26,15 +27,19 @@ CREATE TABLE IF NOT EXISTS life_events (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS life_events_player_created_idx ON life_events(player_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS life_events_player_created_idx
+ON life_events(player_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS chat_messages (
   id BIGSERIAL PRIMARY KEY,
   player_id UUID REFERENCES players(id) ON DELETE SET NULL,
   player_name TEXT NOT NULL,
   location TEXT NOT NULL,
-  message TEXT NOT NULL CHECK (char_length(message) BETWEEN 1 AND 500),
+  message TEXT NOT NULL
+    CHECK (char_length(message) BETWEEN 1 AND 500),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS chat_messages_location_created_idx ON chat_messages(location, created_at DESC);
+CREATE INDEX IF NOT EXISTS chat_messages_location_created_idx
+ON chat_messages(location, created_at DESC);
+
